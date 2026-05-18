@@ -1,0 +1,1516 @@
+// Package ginext is Pulp's Gin-based HTTP transport extension. It registers
+// four capabilities covering inbound HTTP, outbound fetch, WebSocket, and SSE.
+//
+// All four capabilities share a single Gin engine. The engine is created by
+// transport.http.inbound's Setup and the underlying server is stopped by its
+// Teardown. WebSocket and SSE routes are served through the same listener —
+// dedicated Gin handlers delegate based on path registration.
+//
+// Environment variables:
+//
+//	HTTP_PORT  — listen port (default 8080)
+//	HTTP_CERT  — path to TLS certificate PEM (optional)
+//	HTTP_KEY   — path to TLS private key PEM (optional)
+package ginext
+
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/BananaLabs-OSS/Pulp/abi"
+	"github.com/BananaLabs-OSS/Pulp/ext"
+	"github.com/coder/websocket"
+	"github.com/gin-gonic/gin"
+	"github.com/tetratelabs/wazero"
+	"github.com/tetratelabs/wazero/api"
+	"github.com/vmihailenco/msgpack/v5"
+)
+
+// ---------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------
+
+const (
+	// Long enough for admin operations that synchronously orchestrate
+	// container provisioning (sidecar resolve + bananagine create +
+	// startup wait can take ~60s in worst case).
+	defaultRequestTimeout = 120 * time.Second
+	defaultFetchTimeout   = 30 * time.Second
+	sseKeepalive          = 15 * time.Second
+)
+
+// ---------------------------------------------------------------------
+// Module-level shared state
+// ---------------------------------------------------------------------
+
+var (
+	server      *ginServer
+	httpFetcher *fetcher
+	ws          *wsServer
+	sse         *sseServer
+)
+
+// ---------------------------------------------------------------------
+// init — register all four capabilities
+// ---------------------------------------------------------------------
+
+func init() {
+	ext.Register(ext.Capability{
+		Name:           "transport.http.inbound",
+		Register:       httpInboundRegister,
+		Stub:           httpInboundStub,
+		Setup:          httpInboundSetup,
+		Teardown:       httpInboundTeardown,
+		TeardownCell: httpInboundTeardownCell,
+		Poll:           httpInboundPoll,
+		Finalize:       httpInboundFinalize,
+	})
+
+	ext.Register(ext.Capability{
+		Name:     "transport.http.outbound",
+		Register: httpOutboundRegister,
+		Stub:     httpOutboundStub,
+	})
+
+	ext.Register(ext.Capability{
+		Name:           "transport.ws.inbound",
+		Register:       wsInboundRegister,
+		Stub:           wsInboundStub,
+		TeardownCell: transportTeardownCell,
+	})
+
+	ext.Register(ext.Capability{
+		Name:           "transport.sse",
+		Register:       sseRegister,
+		Stub:           sseStub,
+		TeardownCell: transportTeardownCell,
+	})
+}
+
+// httpInboundTeardownCell + transportTeardownCell mark the cell
+// as dead across the shared server instance. Gin's route tree is
+// append-only so we can't physically remove routes; the route closures
+// check `cellDead` and return 404. Any in-flight requests owned by
+// the cell receive a 503 so finalize doesn't deadlock.
+func httpInboundTeardownCell(_ context.Context, cellID string) error {
+	if server != nil {
+		server.markCellDead(cellID)
+	}
+	return nil
+}
+
+func transportTeardownCell(_ context.Context, cellID string) error {
+	if server != nil {
+		server.markCellDead(cellID)
+	}
+	return nil
+}
+
+// =====================================================================
+// Gin-based HTTP server
+// =====================================================================
+
+type inflightRequest struct {
+	req      abi.HTTPRequest
+	respCh   chan abi.HTTPResponse
+	cellID string // owning cell — set when the matching route was registered
+}
+
+type ginServer struct {
+	addr   string
+	logger *slog.Logger
+
+	engine *gin.Engine
+
+	mu      sync.Mutex
+	pending map[uint64]*inflightRequest
+	nextID  atomic.Uint64
+
+	queue chan *inflightRequest
+	srv   *http.Server
+	ws    *wsServer
+	sse   *sseServer
+
+	certPath string
+	keyPath  string
+
+	altMu      sync.Mutex
+	altServers map[string]*http.Server
+
+	// deadCells flags cells whose routes should no longer serve.
+	// Gin's engine doesn't support route removal, so each route closure
+	// checks cellDead() and returns 404 when true. TeardownCell
+	// writes here; registerRoute clears via reviveCell() so a
+	// reloaded cell with the same ID gets a clean slate.
+	cellRoutesMu sync.RWMutex
+	deadCells    map[string]struct{}
+}
+
+func newGinServer(addr string, logger *slog.Logger) *ginServer {
+	gin.SetMode(gin.ReleaseMode)
+	engine := gin.New()
+	// gin.Recovery() wraps handlers so a panic inside the cell-invoked
+	// dispatch loop surfaces as a 500 rather than leaving the client
+	// hanging until defaultRequestTimeout. gin.New() deliberately omits
+	// this; we add it back.
+	engine.Use(gin.Recovery())
+
+	// Gin's default NoRoute uses http.NotFound which injects
+	// "Content-Type: text/plain; charset=utf-8" + "X-Content-Type-Options: nosniff".
+	// Native Gin services (without extra NoRoute handlers) emit the
+	// same headers — so this matches parity by default. But many
+	// native services register no NoRoute and rely on Gin's built-in,
+	// which emits the exact stdlib defaults. Override here so both
+	// sides agree on "text/plain" bare (matching real-world Gin
+	// services that explicitly set NoRoute) — any cell that wants
+	// the stdlib shape can override by registering its own catch-all.
+	engine.NoRoute(func(c *gin.Context) {
+		c.Data(http.StatusNotFound, "text/plain", []byte("404 page not found"))
+	})
+
+	return &ginServer{
+		addr:        addr,
+		logger:      logger,
+		engine:      engine,
+		pending:     map[uint64]*inflightRequest{},
+		queue:       make(chan *inflightRequest, 64),
+		altServers:  map[string]*http.Server{},
+		deadCells: map[string]struct{}{},
+	}
+}
+
+func (s *ginServer) attachWebSocket(w *wsServer) { s.ws = w }
+func (s *ginServer) attachSSE(e *sseServer)      { s.sse = e }
+
+func (s *ginServer) enableTLS(certPath, keyPath string) error {
+	if strings.TrimSpace(certPath) == "" || strings.TrimSpace(keyPath) == "" {
+		return errors.New("both certPath and keyPath are required")
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		return fmt.Errorf("load tls cert/key: %w", err)
+	}
+	s.certPath = certPath
+	s.keyPath = keyPath
+	s.logger.Info("http tls enabled", "cert", certPath)
+	return nil
+}
+
+func (s *ginServer) registerRoute(cellID, method, pattern string) error {
+	if cellID == "" {
+		return errors.New("cellID is required")
+	}
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if method == "" {
+		return errors.New("method is required")
+	}
+	if !strings.HasPrefix(pattern, "/") {
+		return fmt.Errorf("pattern %q must begin with /", pattern)
+	}
+
+	// Clear any lingering dead-mark so a re-loaded cell with the same
+	// ID gets a clean slate.
+	s.reviveCell(cellID)
+
+	// Gin uses :param syntax natively — the cell's route format already
+	// uses :param, so we pass the pattern straight through. If the path
+	// was previously installed as an SSE route, the Gin tree will panic
+	// on duplicate-route; engineHandleSafe turns that into an error we
+	// swallow with a log — the SSE handler remains as the owner of the
+	// path. Same deferral semantics as registerSSERoute's conflict case,
+	// just the other direction.
+	if err := s.engineHandleSafe(func() {
+		s.engine.Handle(method, pattern, func(c *gin.Context) {
+			if s.cellDead(cellID) {
+				// Match bare "text/plain" shape used by NoRoute so
+				// parity tests comparing a dead-cell 404 against a
+				// fresh-install 404 see identical wire bytes. c.String
+				// would add "; charset=utf-8" and break that.
+				c.Data(http.StatusNotFound, "text/plain", []byte("404 page not found"))
+				return
+			}
+			s.handleHTTPRequestFor(c, cellID)
+		})
+	}); err != nil {
+		s.logger.Info("http route deferred (another route already present)", "cell", cellID, "method", method, "pattern", pattern)
+		return nil
+	}
+
+	// Auto-register OPTIONS for the same pattern so CORS preflights get
+	// dispatched to the cell (where global CORS middleware can handle
+	// them). Native Gin services rely on this implicitly via a global
+	// CORS middleware that sees every request; the host's per-(method,
+	// pattern) routing model doesn't deliver OPTIONS unless it's
+	// registered. Duplicate registration (multiple routes on the same
+	// pattern) is harmless — engineHandleSafe swallows the panic.
+	if method != "OPTIONS" {
+		_ = s.engineHandleSafe(func() {
+			s.engine.Handle("OPTIONS", pattern, func(c *gin.Context) {
+				if s.cellDead(cellID) {
+					c.Data(http.StatusNotFound, "text/plain", []byte("404 page not found"))
+					return
+				}
+				s.handleHTTPRequestFor(c, cellID)
+			})
+		})
+	}
+	s.logger.Info("http route registered", "cell", cellID, "method", method, "pattern", pattern)
+	return nil
+}
+
+func (s *ginServer) registerWSRoute(cellID, path string) error {
+	if cellID == "" {
+		return errors.New("cellID is required")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("ws path %q must begin with /", path)
+	}
+	if s.ws == nil {
+		return errors.New("ws server not attached")
+	}
+	s.reviveCell(cellID)
+	s.ws.registerRoute(path, cellID)
+	if err := s.engineHandleSafe(func() {
+		s.engine.GET(path, func(c *gin.Context) {
+			if s.cellDead(cellID) {
+				c.Data(http.StatusNotFound, "text/plain", []byte("404 page not found"))
+				return
+			}
+			s.ws.upgrade(c.Writer, c.Request, cellID)
+		})
+	}); err != nil {
+		return fmt.Errorf("register ws %s: %w", path, err)
+	}
+	s.logger.Info("ws route registered", "cell", cellID, "path", path)
+	return nil
+}
+
+func (s *ginServer) registerSSERoute(cellID, path string) error {
+	if cellID == "" {
+		return errors.New("cellID is required")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("sse path %q must begin with /", path)
+	}
+	if s.sse == nil {
+		return errors.New("sse server not attached")
+	}
+	s.reviveCell(cellID)
+	// Always record the path for emit() pattern-matching; the SSE
+	// server needs it in its route map so sse.Emit() knows whether a
+	// given concrete path is allowed.
+	s.sse.registerRoute(path)
+	// Try to install a Gin handler that serves SSE directly. If the
+	// cell also registered a regular GET handler at this path (e.g.
+	// long-poll as a fallback for WASM where SSE step-loop is tricky),
+	// Gin will panic on duplicate-route and engineHandleSafe captures
+	// the error. In that case we log and continue — the cell's GET
+	// handler will serve the path, and SSE emits with zero subscribers
+	// are harmless no-ops. Registering the path in the sse map above
+	// is still useful because emit() validates the target path belongs
+	// to a known SSE route.
+	if err := s.engineHandleSafe(func() {
+		s.engine.GET(path, func(c *gin.Context) {
+			if s.cellDead(cellID) {
+				c.Data(http.StatusNotFound, "text/plain", []byte("404 page not found"))
+				return
+			}
+			s.sse.handle(c.Writer, c.Request)
+		})
+	}); err != nil {
+		s.logger.Info("sse route deferred (http route already present)", "cell", cellID, "path", path)
+		return nil
+	}
+	s.logger.Info("sse route registered", "cell", cellID, "path", path)
+	return nil
+}
+
+// engineHandleSafe runs a route registration with a recover. Gin's
+// engine.Handle panics when a conflicting route is already registered
+// (e.g., a cell reloaded before the old routes were scrubbed, or two
+// cells race on the same path). We catch the panic and turn it into
+// a plain error so the cell gets a useful return code instead of
+// taking down the host.
+func (s *ginServer) engineHandleSafe(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("engine.Handle panic: %v", r)
+		}
+	}()
+	fn()
+	return nil
+}
+
+// reviveCell clears a stale dead-mark before registering new routes.
+// Without this, a cell reloaded under the same cellID would have
+// every new route born 404 because cellDead() would still see the
+// old teardown flag.
+func (s *ginServer) reviveCell(cellID string) {
+	s.cellRoutesMu.Lock()
+	delete(s.deadCells, cellID)
+	s.cellRoutesMu.Unlock()
+}
+
+// cellDead reports whether a cell's routes have been retired via
+// TeardownCell. The lookup is under RLock so the hot path stays
+// cheap; writes via markCellDead hold the exclusive lock.
+func (s *ginServer) cellDead(cellID string) bool {
+	if cellID == "" {
+		return false
+	}
+	s.cellRoutesMu.RLock()
+	_, dead := s.deadCells[cellID]
+	s.cellRoutesMu.RUnlock()
+	return dead
+}
+
+// markCellDead flags a cell so all subsequent requests to its
+// routes fall through to a 404. Also evicts any pending requests owned
+// by that cell so finalize doesn't deadlock.
+func (s *ginServer) markCellDead(cellID string) {
+	if cellID == "" {
+		return
+	}
+	s.cellRoutesMu.Lock()
+	s.deadCells[cellID] = struct{}{}
+	s.cellRoutesMu.Unlock()
+
+	s.mu.Lock()
+	for id, ir := range s.pending {
+		if ir.cellID == cellID {
+			delete(s.pending, id)
+			select {
+			case ir.respCh <- abi.HTTPResponse{ID: id, Status: 503, Body: []byte("cell removed")}:
+			default:
+			}
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *ginServer) handleHTTPRequestFor(c *gin.Context, cellID string) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.String(http.StatusBadRequest, "read body: %s", err.Error())
+		return
+	}
+
+	id := s.nextID.Add(1)
+	headers := map[string]string{}
+	for k, vs := range c.Request.Header {
+		if len(vs) > 0 {
+			headers[k] = vs[0]
+		}
+	}
+	// Go's net/http strips the Host header from Request.Header and moves it
+	// to Request.Host. Re-inject it so cells that call GetHeader("Host")
+	// (e.g. for magic-link URL derivation) see the real value.
+	if c.Request.Host != "" {
+		headers["Host"] = c.Request.Host
+	}
+	query := map[string]string{}
+	for k, vs := range c.Request.URL.Query() {
+		if len(vs) > 0 {
+			query[k] = vs[0]
+		}
+	}
+
+	// Extract path params from Gin's context.
+	params := map[string]string{}
+	for _, p := range c.Params {
+		params[p.Key] = p.Value
+	}
+
+	ir := &inflightRequest{
+		req: abi.HTTPRequest{
+			ID:         id,
+			Method:     c.Request.Method,
+			Path:       c.Request.URL.Path,
+			Params:     params,
+			Query:      query,
+			Headers:    headers,
+			Body:       body,
+			RemoteAddr: c.Request.RemoteAddr,
+		},
+		respCh:   make(chan abi.HTTPResponse, 1),
+		cellID: cellID,
+	}
+
+	s.mu.Lock()
+	s.pending[id] = ir
+	s.mu.Unlock()
+
+	select {
+	case s.queue <- ir:
+	default:
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+		c.String(http.StatusServiceUnavailable, "queue full")
+		return
+	}
+
+	select {
+	case resp := <-ir.respCh:
+		// Content-Type is sent via Header() rather than c.Data(ct,...)
+		// because c.Data injects a default of "text/plain; charset=utf-8"
+		// when given an empty content type — which would override the
+		// cell's explicit choice (and fail parity against native Gin
+		// handlers that emit bare "text/plain" on 404).
+		for k, v := range resp.Headers {
+			c.Header(k, v)
+		}
+		// Multiple Set-Cookie headers are required for multi-cookie
+		// responses. Headers above is single-valued — cookies come
+		// through a separate slice and each appends its own header.
+		for _, cookie := range resp.Cookies {
+			c.Writer.Header().Add("Set-Cookie", cookie)
+		}
+		status := int(resp.Status)
+		if status == 0 {
+			status = http.StatusOK
+		}
+		c.Writer.WriteHeader(status)
+		_, _ = c.Writer.Write(resp.Body)
+	case <-time.After(defaultRequestTimeout):
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+		c.String(http.StatusGatewayTimeout, "cell timeout")
+	}
+}
+
+func (s *ginServer) start(_ context.Context) error {
+	s.srv = &http.Server{
+		Addr:    s.addr,
+		Handler: s.engine,
+	}
+	useTLS := s.certPath != "" && s.keyPath != ""
+	go func() {
+		var err error
+		if useTLS {
+			err = s.srv.ListenAndServeTLS(s.certPath, s.keyPath)
+		} else {
+			err = s.srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("http listen failed", "err", err)
+		}
+	}()
+	s.logger.Info("gin server started", "addr", s.addr, "tls", useTLS)
+	return nil
+}
+
+func (s *ginServer) stop(ctx context.Context) error {
+	s.altMu.Lock()
+	alts := make([]*http.Server, 0, len(s.altServers))
+	for _, srv := range s.altServers {
+		alts = append(alts, srv)
+	}
+	s.altServers = map[string]*http.Server{}
+	s.altMu.Unlock()
+	for _, srv := range alts {
+		_ = srv.Shutdown(ctx)
+	}
+	if s.srv == nil {
+		return nil
+	}
+	return s.srv.Shutdown(ctx)
+}
+
+// ensureAltListener starts an additional http.Server on addr serving
+// the same Gin engine if one is not already running there. Addresses
+// that match the default server's addr are a no-op. Multiple cells
+// calling with the same addr share the listener.
+func (s *ginServer) ensureAltListener(addr string) error {
+	if addr == "" {
+		return errors.New("addr is required")
+	}
+	if addr == s.addr {
+		return nil
+	}
+	s.altMu.Lock()
+	if _, ok := s.altServers[addr]; ok {
+		s.altMu.Unlock()
+		return nil
+	}
+	srv := &http.Server{Addr: addr, Handler: s.engine}
+	s.altServers[addr] = srv
+	useTLS := s.certPath != "" && s.keyPath != ""
+	certPath, keyPath := s.certPath, s.keyPath
+	s.altMu.Unlock()
+	go func() {
+		var err error
+		if useTLS {
+			// Alt listeners share the main server's TLS cert/key so a
+			// cell declaring a secondary listen address stays on the
+			// same scheme as the primary. Without this the alt listener
+			// silently serves plaintext on a port the cell expected to
+			// be TLS — a correctness hole for admin-plane endpoints.
+			err = srv.ListenAndServeTLS(certPath, keyPath)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		// Bind failed or listener died — drop the map entry so a later
+		// retry actually re-binds instead of no-opping.
+		s.altMu.Lock()
+		if s.altServers[addr] == srv {
+			delete(s.altServers, addr)
+		}
+		s.altMu.Unlock()
+		if err != nil {
+			s.logger.Error("alt listener failed", "addr", addr, "err", err)
+		}
+	}()
+	s.logger.Info("alt listener started", "addr", addr)
+	return nil
+}
+
+func (s *ginServer) popRequest() (abi.HTTPRequest, string, bool) {
+	select {
+	case ir := <-s.queue:
+		return ir.req, ir.cellID, true
+	default:
+		return abi.HTTPRequest{}, "", false
+	}
+}
+
+func (s *ginServer) respond(resp abi.HTTPResponse) error {
+	s.mu.Lock()
+	ir, ok := s.pending[resp.ID]
+	if ok {
+		delete(s.pending, resp.ID)
+	}
+	s.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no pending request id %d", resp.ID)
+	}
+	ir.respCh <- resp
+	return nil
+}
+
+func (s *ginServer) finalize(id uint64) {
+	s.mu.Lock()
+	ir, still := s.pending[id]
+	if still {
+		delete(s.pending, id)
+	}
+	s.mu.Unlock()
+	if still {
+		s.logger.Warn("cell did not respond", "id", id)
+		ir.respCh <- abi.HTTPResponse{
+			ID:     id,
+			Status: 500,
+			Body:   []byte("cell did not respond"),
+		}
+	}
+}
+
+// =====================================================================
+// Fetcher (outbound HTTP)
+// =====================================================================
+
+type fetcher struct {
+	client *http.Client
+	logger *slog.Logger
+}
+
+func newFetcher(logger *slog.Logger) *fetcher {
+	// No Client.Timeout: per-request deadline is applied via context
+	// inside do() so callers can override the 30s default for long
+	// uploads (world archives, etc.) without affecting other requests.
+	return &fetcher{
+		client: &http.Client{},
+		logger: logger,
+	}
+}
+
+func (f *fetcher) do(ctx context.Context, req abi.HTTPFetchRequest) (abi.HTTPResponse, error) {
+	if strings.TrimSpace(req.URL) == "" {
+		return abi.HTTPResponse{}, errors.New("url is required")
+	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	timeout := defaultFetchTimeout
+	if req.Timeout > 0 {
+		timeout = time.Duration(req.Timeout)
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var body io.Reader
+	if len(req.Body) > 0 {
+		body = bytes.NewReader(req.Body)
+	}
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, method, req.URL, body)
+	if err != nil {
+		return abi.HTTPResponse{}, fmt.Errorf("build request: %w", err)
+	}
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := f.client.Do(httpReq)
+	if err != nil {
+		return abi.HTTPResponse{}, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return abi.HTTPResponse{}, fmt.Errorf("read response body: %w", err)
+	}
+
+	headers := map[string]string{}
+	for k, vs := range resp.Header {
+		if len(vs) > 0 {
+			headers[k] = vs[0]
+		}
+	}
+
+	return abi.HTTPResponse{
+		Status:  uint32(resp.StatusCode),
+		Headers: headers,
+		Body:    respBody,
+	}, nil
+}
+
+// =====================================================================
+// WebSocket server
+// =====================================================================
+
+type wsConn struct {
+	id     uint64
+	path   string
+	cellID string
+	conn   *websocket.Conn
+	cancel context.CancelFunc
+}
+
+// wsEvent pairs an encoded step event with the cell it belongs to
+// so Poll can populate StepEvent.CellID for multi-cell fanout.
+type wsEvent struct {
+	cellID string
+	data   []byte
+}
+
+type wsServer struct {
+	logger *slog.Logger
+
+	mu     sync.Mutex
+	routes map[string]string // path → cellID
+	conns  map[uint64]*wsConn
+	nextID atomic.Uint64
+
+	events chan wsEvent
+}
+
+func newWSServer(logger *slog.Logger) *wsServer {
+	return &wsServer{
+		logger: logger,
+		routes: map[string]string{},
+		conns:  map[uint64]*wsConn{},
+		events: make(chan wsEvent, 256),
+	}
+}
+
+func (w *wsServer) registerRoute(path, cellID string) {
+	w.mu.Lock()
+	w.routes[path] = cellID
+	w.mu.Unlock()
+}
+
+// cellForPath resolves which cell owns the given ws path. Returns "" if
+// the path was never registered — the read loop falls back to delivering
+// events with empty CellID in that case (legacy single-cell behavior).
+func (w *wsServer) cellForPath(path string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.routes[path]
+}
+
+func (w *wsServer) upgrade(rw http.ResponseWriter, r *http.Request, cellID string) {
+	conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		w.logger.Error("ws accept failed", "err", err, "path", r.URL.Path)
+		return
+	}
+
+	id := w.nextID.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &wsConn{id: id, path: r.URL.Path, cellID: cellID, conn: conn, cancel: cancel}
+
+	w.mu.Lock()
+	w.conns[id] = c
+	w.mu.Unlock()
+
+	headers := map[string]string{}
+	for k, vs := range r.Header {
+		if len(vs) > 0 {
+			headers[k] = vs[0]
+		}
+	}
+	query := map[string]string{}
+	for k, vs := range r.URL.Query() {
+		if len(vs) > 0 {
+			query[k] = vs[0]
+		}
+	}
+
+	openPayload, err := abi.EncodeWSOpen(abi.WSOpen{
+		ConnID:  id,
+		Path:    r.URL.Path,
+		Query:   query,
+		Headers: headers,
+	})
+	if err == nil {
+		w.enqueueEvent(cellID, abi.EventWSOpen, openPayload)
+	}
+
+	go w.readLoop(ctx, c)
+}
+
+func (w *wsServer) send(ctx context.Context, req abi.WSSendRequest) error {
+	w.mu.Lock()
+	c, ok := w.conns[req.ConnID]
+	w.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no such conn id %d", req.ConnID)
+	}
+	var mt websocket.MessageType
+	switch req.OpCode {
+	case abi.WSOpCodeText:
+		mt = websocket.MessageText
+	case abi.WSOpCodeBinary:
+		mt = websocket.MessageBinary
+	default:
+		return fmt.Errorf("unsupported opcode %d", req.OpCode)
+	}
+	return c.conn.Write(ctx, mt, req.Payload)
+}
+
+func (w *wsServer) close(req abi.WSCloseRequest) error {
+	w.mu.Lock()
+	c, ok := w.conns[req.ConnID]
+	if ok {
+		delete(w.conns, req.ConnID)
+	}
+	w.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no such conn id %d", req.ConnID)
+	}
+	code := websocket.StatusNormalClosure
+	if req.Code != 0 {
+		code = websocket.StatusCode(req.Code)
+	}
+	err := c.conn.Close(code, req.Reason)
+	c.cancel()
+	return err
+}
+
+func (w *wsServer) popEvent() (wsEvent, bool) {
+	select {
+	case ev := <-w.events:
+		return ev, true
+	default:
+		return wsEvent{}, false
+	}
+}
+
+func (w *wsServer) stop() {
+	w.mu.Lock()
+	conns := make([]*wsConn, 0, len(w.conns))
+	for _, c := range w.conns {
+		conns = append(conns, c)
+	}
+	w.conns = map[uint64]*wsConn{}
+	w.mu.Unlock()
+
+	for _, c := range conns {
+		_ = c.conn.Close(websocket.StatusGoingAway, "host shutting down")
+		c.cancel()
+	}
+}
+
+func (w *wsServer) readLoop(ctx context.Context, c *wsConn) {
+	defer func() {
+		w.mu.Lock()
+		_, ok := w.conns[c.id]
+		if ok {
+			delete(w.conns, c.id)
+		}
+		w.mu.Unlock()
+		c.cancel()
+	}()
+
+	for {
+		msgType, data, err := c.conn.Read(ctx)
+		if err != nil {
+			code := uint16(websocket.CloseStatus(err))
+			reason := err.Error()
+			if errors.Is(err, context.Canceled) {
+				reason = "host canceled"
+			}
+			closePayload, encErr := abi.EncodeWSClose(abi.WSClose{
+				ConnID: c.id,
+				Code:   code,
+				Reason: reason,
+			})
+			if encErr == nil {
+				w.enqueueEvent(c.cellID, abi.EventWSClose, closePayload)
+			}
+			return
+		}
+
+		var opcode uint8
+		switch msgType {
+		case websocket.MessageText:
+			opcode = abi.WSOpCodeText
+		case websocket.MessageBinary:
+			opcode = abi.WSOpCodeBinary
+		default:
+			continue
+		}
+		framePayload, err := abi.EncodeWSFrame(abi.WSFrame{
+			ConnID:  c.id,
+			OpCode:  opcode,
+			Payload: data,
+		})
+		if err != nil {
+			continue
+		}
+		w.enqueueEvent(c.cellID, abi.EventWSFrame, framePayload)
+	}
+}
+
+func (w *wsServer) enqueueEvent(cellID, kind string, payload []byte) {
+	data, err := abi.EncodeStepEvent(kind, payload)
+	if err != nil {
+		w.logger.Error("encode step event", "kind", kind, "err", err)
+		return
+	}
+	select {
+	case w.events <- wsEvent{cellID: cellID, data: data}:
+	default:
+		w.logger.Warn("ws event queue full — dropping event", "kind", kind)
+	}
+}
+
+// =====================================================================
+// SSE server
+// =====================================================================
+
+type sseSub struct {
+	id      uint64
+	path    string
+	write   chan []byte
+	done    chan struct{}
+	flusher http.Flusher
+	writer  http.ResponseWriter
+}
+
+type sseServer struct {
+	logger *slog.Logger
+
+	mu     sync.Mutex
+	routes map[string]struct{}
+	subs   map[string]map[uint64]*sseSub
+	nextID atomic.Uint64
+}
+
+func newSSEServer(logger *slog.Logger) *sseServer {
+	return &sseServer{
+		logger: logger,
+		routes: map[string]struct{}{},
+		subs:   map[string]map[uint64]*sseSub{},
+	}
+}
+
+func (s *sseServer) registerRoute(path string) {
+	s.mu.Lock()
+	s.routes[path] = struct{}{}
+	s.mu.Unlock()
+}
+
+func (s *sseServer) handle(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	id := s.nextID.Add(1)
+	sub := &sseSub{
+		id:      id,
+		path:    r.URL.Path,
+		write:   make(chan []byte, 32),
+		done:    make(chan struct{}),
+		flusher: flusher,
+		writer:  w,
+	}
+
+	s.mu.Lock()
+	if _, ok := s.subs[sub.path]; !ok {
+		s.subs[sub.path] = map[uint64]*sseSub{}
+	}
+	s.subs[sub.path][id] = sub
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		if m, ok := s.subs[sub.path]; ok {
+			delete(m, id)
+		}
+		s.mu.Unlock()
+		close(sub.done)
+	}()
+
+	ticker := time.NewTicker(sseKeepalive)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if _, err := w.Write([]byte(":ping\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
+		case payload := <-sub.write:
+			if _, err := w.Write(payload); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *sseServer) emit(req abi.SSEEmitRequest) error {
+	s.mu.Lock()
+	if !s.matchRouteLocked(req.Path) {
+		s.mu.Unlock()
+		return fmt.Errorf("no sse route %q", req.Path)
+	}
+	targets := make([]*sseSub, 0, len(s.subs[req.Path]))
+	for _, sub := range s.subs[req.Path] {
+		targets = append(targets, sub)
+	}
+	s.mu.Unlock()
+
+	payload := formatSSEFrame(req)
+	for _, sub := range targets {
+		select {
+		case sub.write <- payload:
+		default:
+			s.logger.Warn("sse subscriber slow — dropping event", "path", req.Path, "sub", sub.id)
+		}
+	}
+	return nil
+}
+
+// hasSubscribers returns the number of currently connected subscribers
+// for a concrete path. The cell passes the actual request path it
+// wants to emit to (not the :param pattern), so this is an exact-match
+// lookup against the subs map.
+func (s *sseServer) hasSubscribers(path string) uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return uint32(len(s.subs[path]))
+}
+
+// matchRouteLocked reports whether path matches any registered route
+// pattern. Exact matches win; otherwise each registered pattern is
+// split by "/" and segments compared — literal segments must match,
+// ":param" segments match any non-empty token. Caller holds s.mu.
+func (s *sseServer) matchRouteLocked(path string) bool {
+	if _, ok := s.routes[path]; ok {
+		return true
+	}
+	pathParts := strings.Split(path, "/")
+	for pattern := range s.routes {
+		if !strings.Contains(pattern, ":") {
+			continue
+		}
+		patParts := strings.Split(pattern, "/")
+		if len(patParts) != len(pathParts) {
+			continue
+		}
+		ok := true
+		for i, p := range patParts {
+			if strings.HasPrefix(p, ":") {
+				if pathParts[i] == "" {
+					ok = false
+					break
+				}
+				continue
+			}
+			if p != pathParts[i] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *sseServer) stop() {
+	s.mu.Lock()
+	s.subs = map[string]map[uint64]*sseSub{}
+	s.mu.Unlock()
+}
+
+func formatSSEFrame(req abi.SSEEmitRequest) []byte {
+	var b strings.Builder
+	if req.ID != "" {
+		b.WriteString("id: ")
+		b.WriteString(req.ID)
+		b.WriteString("\n")
+	}
+	if req.Event != "" {
+		b.WriteString("event: ")
+		b.WriteString(req.Event)
+		b.WriteString("\n")
+	}
+	for _, line := range strings.Split(req.Data, "\n") {
+		b.WriteString("data: ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	return []byte(b.String())
+}
+
+// =====================================================================
+// Capability lifecycle: transport.http.inbound
+// =====================================================================
+
+func httpInboundSetup(env ext.SetupEnv) error {
+	port := os.Getenv("HTTP_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	addr := ":" + port
+	logger := env.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	server = newGinServer(addr, logger)
+	httpFetcher = newFetcher(logger)
+	ws = newWSServer(logger)
+	sse = newSSEServer(logger)
+
+	server.attachWebSocket(ws)
+	server.attachSSE(sse)
+
+	certPath := os.Getenv("HTTP_CERT")
+	keyPath := os.Getenv("HTTP_KEY")
+	if certPath != "" && keyPath != "" {
+		if err := server.enableTLS(certPath, keyPath); err != nil {
+			return fmt.Errorf("enable tls: %w", err)
+		}
+	}
+
+	return server.start(context.Background())
+}
+
+func httpInboundTeardown(ctx context.Context) error {
+	if ws != nil {
+		ws.stop()
+	}
+	if sse != nil {
+		sse.stop()
+	}
+	if server != nil {
+		return server.stop(ctx)
+	}
+	return nil
+}
+
+func httpInboundPoll() (ext.StepEvent, bool) {
+	// Check HTTP queue first.
+	if server != nil {
+		if req, cellID, ok := server.popRequest(); ok {
+			payload, err := abi.EncodeHTTPRequest(req)
+			if err != nil {
+				server.logger.Error("encode http request", "err", err)
+				return ext.StepEvent{}, false
+			}
+			return ext.StepEvent{
+				Kind:     "http.request",
+				Payload:  payload,
+				ID:       req.ID,
+				CellID: cellID,
+			}, true
+		}
+	}
+
+	// Then check WebSocket events.
+	if ws != nil {
+		if wev, ok := ws.popEvent(); ok {
+			ev, err := abi.DecodeStepEvent(wev.data)
+			if err != nil {
+				ws.logger.Error("decode ws step event", "err", err)
+				return ext.StepEvent{}, false
+			}
+			return ext.StepEvent{
+				Kind:    ev.Kind,
+				Payload: ev.Payload,
+				CellID:  wev.cellID,
+			}, true
+		}
+	}
+
+	return ext.StepEvent{}, false
+}
+
+func httpInboundFinalize(id uint64) {
+	if server != nil {
+		server.finalize(id)
+	}
+}
+
+// =====================================================================
+// Capability bindings: transport.http.inbound
+// =====================================================================
+
+func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := cell.Name()
+	// http_listen(addr) — cell declares an additional listen address.
+	// If it matches the default HTTP_PORT-derived addr, it's a no-op.
+	// Otherwise an additional http.Server is started sharing the same
+	// Gin engine. Multiple cells calling the same addr share one
+	// listener; stop() tears them all down.
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			var reg struct {
+				Addr string `msgpack:"addr"`
+			}
+			if err := msgpack.Unmarshal(data, &reg); err != nil {
+				return 3
+			}
+			if reg.Addr == "" {
+				return 4
+			}
+			if err := server.ensureAltListener(reg.Addr); err != nil {
+				server.logger.Error("http_listen bind failed", "addr", reg.Addr, "err", err)
+				return 5
+			}
+			return 0
+		}).
+		Export("http_listen")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			var reg struct {
+				Method string `msgpack:"method"`
+				Path   string `msgpack:"path"`
+			}
+			if err := msgpack.Unmarshal(data, &reg); err != nil {
+				return 3
+			}
+			if err := server.registerRoute(cellID, reg.Method, reg.Path); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("http_register")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, respPtr, respLen uint32) uint32 {
+			if respLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(respPtr, respLen)
+			if !ok {
+				return 2
+			}
+			resp, err := abi.DecodeHTTPResponse(data)
+			if err != nil {
+				return 3
+			}
+			if err := server.respond(resp); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("http_respond")
+
+	return nil
+}
+
+func httpInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("http_listen")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("http_register")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("http_respond")
+	return nil
+}
+
+// =====================================================================
+// Capability bindings: transport.http.outbound
+// =====================================================================
+
+func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			req, err := abi.DecodeHTTPFetchRequest(data)
+			if err != nil {
+				return 3
+			}
+
+			resp, err := httpFetcher.do(ctx, req)
+			if err != nil {
+				return 4
+			}
+
+			respBytes, err := abi.EncodeHTTPResponse(resp)
+			if err != nil {
+				return 5
+			}
+
+			allocFn := m.ExportedFunction("pulp_alloc")
+			if allocFn == nil {
+				return 6
+			}
+			results, err := allocFn.Call(ctx, uint64(len(respBytes)))
+			if err != nil || len(results) == 0 {
+				return 7
+			}
+			respPtr := uint32(results[0])
+			if respPtr == 0 {
+				return 7
+			}
+
+			if !m.Memory().Write(respPtr, respBytes) {
+				return 8
+			}
+			if !m.Memory().WriteUint32Le(respPtrOut, respPtr) {
+				return 8
+			}
+			if !m.Memory().WriteUint32Le(respLenOut, uint32(len(respBytes))) {
+				return 8
+			}
+			return 0
+		}).
+		Export("http_fetch")
+	return nil
+}
+
+func httpOutboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _, _, _ uint32) uint32 { return 99 }).
+		Export("http_fetch")
+	return nil
+}
+
+// =====================================================================
+// Capability bindings: transport.ws.inbound
+// =====================================================================
+
+func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := cell.Name()
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
+			if pathLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(pathPtr, pathLen)
+			if !ok {
+				return 2
+			}
+			if err := server.registerWSRoute(cellID, string(data)); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("ws_register")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			req, err := abi.DecodeWSSendRequest(data)
+			if err != nil {
+				return 3
+			}
+			if err := ws.send(ctx, req); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("ws_send")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			req, err := abi.DecodeWSCloseRequest(data)
+			if err != nil {
+				return 3
+			}
+			if err := ws.close(req); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("ws_close")
+
+	return nil
+}
+
+func wsInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("ws_register")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("ws_send")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("ws_close")
+	return nil
+}
+
+// =====================================================================
+// Capability bindings: transport.sse
+// =====================================================================
+
+func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := cell.Name()
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
+			if pathLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(pathPtr, pathLen)
+			if !ok {
+				return 2
+			}
+			if err := server.registerSSERoute(cellID, string(data)); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("sse_register")
+
+	b.NewFunctionBuilder().
+		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			if reqLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(reqPtr, reqLen)
+			if !ok {
+				return 2
+			}
+			req, err := abi.DecodeSSEEmitRequest(data)
+			if err != nil {
+				return 3
+			}
+			if err := sse.emit(req); err != nil {
+				return 4
+			}
+			return 0
+		}).
+		Export("sse_emit")
+
+	// sse_has_subscribers(path_ptr, path_len, out_count_ptr) — cell
+	// passes the concrete path; host writes the number of currently
+	// connected clients into the uint32 at out_count_ptr.
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, m api.Module, pathPtr, pathLen, outCountPtr uint32) uint32 {
+			if pathLen == 0 {
+				return 1
+			}
+			data, ok := m.Memory().Read(pathPtr, pathLen)
+			if !ok {
+				return 2
+			}
+			count := sse.hasSubscribers(string(data))
+			if !m.Memory().WriteUint32Le(outCountPtr, count) {
+				return 8
+			}
+			return 0
+		}).
+		Export("sse_has_subscribers")
+
+	return nil
+}
+
+func sseStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("sse_register")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _ uint32) uint32 { return 99 }).
+		Export("sse_emit")
+	b.NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module, _, _, _ uint32) uint32 { return 99 }).
+		Export("sse_has_subscribers")
+	return nil
+}
