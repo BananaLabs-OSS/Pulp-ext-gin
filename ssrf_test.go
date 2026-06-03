@@ -117,6 +117,66 @@ func TestSSRFAllowlistDoesNotLeakOnRedirect(t *testing.T) {
 	}
 }
 
+// TestSSRFDefaultAllowsInternalServiceHosts verifies the built-in default
+// allow-set exempts Evolution's first-party internal service hostnames
+// (Bananagine + minecraft-resolver) WITHOUT any HTTP_FETCH_ALLOW config, so
+// Evolution -> Bananagine works out-of-box. The exemption is by exact
+// hostname, checked here against the guard's hostAllowed (the same per-dial
+// decision dialContext makes).
+func TestSSRFDefaultAllowsInternalServiceHosts(t *testing.T) {
+	t.Setenv("HTTP_FETCH_ALLOW", "")
+	g := newEgressGuard("")
+
+	exempt := []string{
+		"bananagine",
+		"bananagine:3000",
+		"minecraft-resolver",
+		"minecraft-resolver:8080",
+		"BANANAGINE",           // case-insensitive
+		"minecraft-resolver:9", // bare name matches even on a non-default port
+	}
+	for _, h := range exempt {
+		if !g.hostAllowed(h) {
+			t.Fatalf("expected internal service host %q to be allowed by default, was blocked", h)
+		}
+	}
+}
+
+// TestSSRFDefaultStillBlocksArbitraryInternal verifies the default allow-set
+// does NOT widen the IP block: a cell's user-supplied URL pointed at the
+// cloud-metadata endpoint or an arbitrary internal IP is still refused even
+// though the internal service NAMES are now exempt. Security holds.
+func TestSSRFDefaultStillBlocksArbitraryInternal(t *testing.T) {
+	f := newTestFetcher(t, "") // default guard, internal names exempt
+
+	// hostAllowed must NOT match arbitrary internal IPs or other names.
+	if f.guard.hostAllowed("169.254.169.254") {
+		t.Fatal("metadata IP must not be on the default name allowlist")
+	}
+	if f.guard.hostAllowed("10.0.0.5:3000") {
+		t.Fatal("arbitrary RFC-1918 IP must not be on the default name allowlist")
+	}
+	if f.guard.hostAllowed("evil-internal") {
+		t.Fatal("an unknown internal name must not be on the default allowlist")
+	}
+
+	// And an end-to-end dial to those still errors with a blocked-target.
+	cases := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://10.0.0.5/",
+		"http://192.168.1.1:3000/",
+	}
+	for _, url := range cases {
+		_, err := f.do(context.Background(), abi.HTTPFetchRequest{URL: url})
+		if err == nil {
+			t.Fatalf("expected %s to stay blocked under the default allow-set, got nil", url)
+		}
+		if !strings.Contains(err.Error(), "blocked") {
+			t.Fatalf("expected a blocked-target error for %s, got: %v", url, err)
+		}
+	}
+}
+
 // ipBlocked sanity: the helper itself classifies ranges correctly.
 func TestIPBlockedClassification(t *testing.T) {
 	blocked := []string{"127.0.0.1", "169.254.169.254", "10.1.2.3", "192.168.0.1", "172.16.5.5", "::1", "fc00::1", "0.0.0.0"}

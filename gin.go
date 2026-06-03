@@ -647,8 +647,20 @@ func (s *ginServer) finalize(id uint64) {
 //     refused mid-chain.
 //
 // A genuinely-needed internal host can be allowlisted via the
-// HTTP_FETCH_ALLOW env var (comma-separated host[:port] or CIDR entries);
-// default is deny-all-private.
+// HTTP_FETCH_ALLOW env var (comma-separated host[:port] or CIDR entries).
+// On TOP of whatever the env supplies, the guard seeds a built-in default
+// allow-set of the platform's own first-party internal service HOSTNAMES
+// (see defaultInternalServiceHosts). Those services live on the Docker
+// bridge at RFC-1918 / loopback addresses, so a pure deny-all-private
+// default would break Evolution's out-of-box calls to Bananagine and the
+// minecraft-resolver. The exemption is keyed on the exact dialed HOSTNAME
+// (e.g. "bananagine", "minecraft-resolver:8080"), NOT on an IP range — so
+// it admits ONLY those known first-party names. A cell's user-supplied URL
+// pointed at an arbitrary internal IP (169.254.169.254 metadata, a raw
+// 10.x/172.16.x/192.168.x address, or any host not on this exact name list)
+// is still IP-blocked. This is the platform egress posture, mirroring
+// Pulp-ext-http; the default-allow merely restores the legit internal path
+// without requiring a deploy-time HTTP_FETCH_ALLOW.
 //
 // The name-allowlist exemption is decided PER DIAL against the host the
 // dialer is actually about to connect to, NOT pinned once onto the request
@@ -664,8 +676,29 @@ var errBlockedTarget = errors.New("ssrf guard: target IP is in a blocked (privat
 
 var errBlockedScheme = errors.New("ssrf guard: only http and https schemes are permitted")
 
+// defaultInternalServiceHosts is the built-in allow-set of the platform's
+// own first-party internal service hostnames. These are the Docker service
+// names Evolution dials by name on its hot paths — Bananagine (game
+// orchestration host, default port 3000) and the minecraft-resolver
+// (mod/version resolver sidecar, default port 8080). They resolve to
+// private/loopback bridge IPs, so without this default the deny-all-private
+// guard would block Evolution's out-of-box internal calls. Both the bare
+// name and the canonical host:port form are listed so the per-dial
+// hostAllowed match succeeds whether or not the dialed address carries the
+// default port. Only these EXACT names are exempt; an arbitrary internal IP
+// or metadata address supplied by a cell is NOT on this list and stays
+// blocked. Operators can extend the set via HTTP_FETCH_ALLOW (merged below)
+// for non-default hostnames or ports.
+var defaultInternalServiceHosts = []string{
+	"bananagine",
+	"bananagine:3000",
+	"minecraft-resolver",
+	"minecraft-resolver:8080",
+}
+
 // egressGuard decides whether an outbound request may proceed. It is
-// constructed once per fetcher from the HTTP_FETCH_ALLOW env var.
+// constructed once per fetcher from the built-in default internal-service
+// allow-set MERGED with the HTTP_FETCH_ALLOW env var.
 type egressGuard struct {
 	// allowHosts is a set of explicitly-permitted host strings
 	// (lower-cased, host or host:port) that bypass the IP block.
@@ -675,12 +708,21 @@ type egressGuard struct {
 	allowNets []*net.IPNet
 }
 
-// newEgressGuard parses HTTP_FETCH_ALLOW into an egressGuard. Entries are
-// comma-separated; an entry containing "/" is parsed as a CIDR, otherwise
-// it's a literal host (optionally host:port). Whitespace and empty entries
-// are ignored. Malformed entries are skipped.
+// newEgressGuard builds an egressGuard from the built-in default
+// internal-service allow-set MERGED with HTTP_FETCH_ALLOW. The default
+// first-party service hostnames are seeded first so Evolution's internal
+// calls work out-of-box; the env then adds any operator-supplied entries on
+// top. Entries are comma-separated; an entry containing "/" is parsed as a
+// CIDR, otherwise it's a literal host (optionally host:port). Whitespace and
+// empty entries are ignored. Malformed entries are skipped.
 func newEgressGuard(allowList string) *egressGuard {
 	g := &egressGuard{allowHosts: map[string]struct{}{}}
+	// Seed the built-in first-party internal service hosts. These are exempt
+	// by EXACT hostname only — an arbitrary private/metadata IP is not on the
+	// list and stays IP-blocked.
+	for _, h := range defaultInternalServiceHosts {
+		g.allowHosts[strings.ToLower(h)] = struct{}{}
+	}
 	for _, raw := range strings.Split(allowList, ",") {
 		entry := strings.TrimSpace(raw)
 		if entry == "" {
