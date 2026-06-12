@@ -1199,6 +1199,7 @@ type sseSub struct {
 	path    string
 	write   chan []byte
 	done    chan struct{}
+	stop    chan struct{} // closed by sseServer.stop() to unblock handle()
 	flusher http.Flusher
 	writer  http.ResponseWriter
 }
@@ -1245,6 +1246,7 @@ func (s *sseServer) handle(w http.ResponseWriter, r *http.Request) {
 		path:    r.URL.Path,
 		write:   make(chan []byte, 32),
 		done:    make(chan struct{}),
+		stop:    make(chan struct{}),
 		flusher: flusher,
 		writer:  w,
 	}
@@ -1271,6 +1273,8 @@ func (s *sseServer) handle(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-sub.stop:
 			return
 		case <-ticker.C:
 			if _, err := w.Write([]byte(":ping\n\n")); err != nil {
@@ -1359,8 +1363,19 @@ func (s *sseServer) matchRouteLocked(path string) bool {
 
 func (s *sseServer) stop() {
 	s.mu.Lock()
+	old := s.subs
 	s.subs = map[string]map[uint64]*sseSub{}
 	s.mu.Unlock()
+	// Signal every active handler goroutine to return via its stop channel.
+	// This unblocks http.Server.Shutdown instead of letting it wait
+	// forever on open SSE connections. Using a dedicated stop channel
+	// (rather than closing sub.write) avoids a data race with concurrent
+	// emit() calls that may still hold a reference to the old sub list.
+	for _, subs := range old {
+		for _, sub := range subs {
+			close(sub.stop)
+		}
+	}
 }
 
 func formatSSEFrame(req abi.SSEEmitRequest) []byte {
