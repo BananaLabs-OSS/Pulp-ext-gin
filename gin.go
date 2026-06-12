@@ -1023,7 +1023,7 @@ func (w *wsServer) cellForPath(path string) string {
 
 func (w *wsServer) upgrade(rw http.ResponseWriter, r *http.Request, cellID string) {
 	conn, err := websocket.Accept(rw, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: false,
 	})
 	if err != nil {
 		w.logger.Error("ws accept failed", "err", err, "path", r.URL.Path)
