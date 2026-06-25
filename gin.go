@@ -698,6 +698,11 @@ var defaultInternalServiceHosts = []string{
 // Fetcher (outbound HTTP)
 // =====================================================================
 
+// maxFetchBodyBytes caps the response body read in fetcher.do() to prevent
+// an oversized (or infinite) response from exhausting host memory. Matches
+// the 50 MiB limit used by Pulp-ext-http's legacy http_fetch path (B13).
+const maxFetchBodyBytes int64 = 50 * 1024 * 1024 // 50 MiB
+
 type fetcher struct {
 	client *http.Client
 	guard  *ssrfguard.EgressGuard
@@ -786,7 +791,7 @@ func (f *fetcher) do(ctx context.Context, req abi.HTTPFetchRequest) (abi.HTTPRes
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxFetchBodyBytes))
 	if err != nil {
 		return abi.HTTPResponse{}, fmt.Errorf("read response body: %w", err)
 	}
