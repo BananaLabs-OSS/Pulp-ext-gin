@@ -10,9 +10,11 @@ import (
 	"testing"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
+	"github.com/BananaLabs-OSS/Pulp/ssrfguard"
 )
 
-// newTestFetcher builds a fetcher with the given HTTP_FETCH_ALLOW value.
+// newTestFetcher builds a fetcher with the given HTTP_FETCH_ALLOW value,
+// using the ext-gin constructor which pre-seeds defaultInternalServiceHosts.
 func newTestFetcher(t *testing.T, allow string) *fetcher {
 	t.Helper()
 	t.Setenv("HTTP_FETCH_ALLOW", allow)
@@ -121,11 +123,16 @@ func TestSSRFAllowlistDoesNotLeakOnRedirect(t *testing.T) {
 // allow-set exempts Evolution's first-party internal service hostnames
 // (Bananagine + minecraft-resolver) WITHOUT any HTTP_FETCH_ALLOW config, so
 // Evolution -> Bananagine works out-of-box. The exemption is by exact
-// hostname, checked here against the guard's hostAllowed (the same per-dial
-// decision dialContext makes).
+// hostname, checked here against the guard's HostAllowed (the same per-dial
+// decision DialContext makes).
+//
+// This test exercises the seedHosts seeding path of ssrfguard.NewEgressGuard.
+// It MUST remain in ext-gin: it proves that ext-gin's call site passes
+// defaultInternalServiceHosts as seedHosts, which is the intentional
+// behavioural difference between ext-gin and ext-http/ext-workers.
 func TestSSRFDefaultAllowsInternalServiceHosts(t *testing.T) {
 	t.Setenv("HTTP_FETCH_ALLOW", "")
-	g := newEgressGuard("")
+	g := ssrfguard.NewEgressGuard("", defaultInternalServiceHosts)
 
 	exempt := []string{
 		"bananagine",
@@ -136,7 +143,7 @@ func TestSSRFDefaultAllowsInternalServiceHosts(t *testing.T) {
 		"minecraft-resolver:9", // bare name matches even on a non-default port
 	}
 	for _, h := range exempt {
-		if !g.hostAllowed(h) {
+		if !g.HostAllowed(h) {
 			t.Fatalf("expected internal service host %q to be allowed by default, was blocked", h)
 		}
 	}
@@ -146,17 +153,22 @@ func TestSSRFDefaultAllowsInternalServiceHosts(t *testing.T) {
 // does NOT widen the IP block: a cell's user-supplied URL pointed at the
 // cloud-metadata endpoint or an arbitrary internal IP is still refused even
 // though the internal service NAMES are now exempt. Security holds.
+//
+// This test MUST remain in ext-gin: it proves that seeding
+// defaultInternalServiceHosts does not accidentally open IP-based bypasses
+// (an arbitrary 10.x or 169.254.x address, not on the exact name list, is
+// still refused). Critical security regression guard.
 func TestSSRFDefaultStillBlocksArbitraryInternal(t *testing.T) {
 	f := newTestFetcher(t, "") // default guard, internal names exempt
 
-	// hostAllowed must NOT match arbitrary internal IPs or other names.
-	if f.guard.hostAllowed("169.254.169.254") {
+	// HostAllowed must NOT match arbitrary internal IPs or other names.
+	if f.guard.HostAllowed("169.254.169.254") {
 		t.Fatal("metadata IP must not be on the default name allowlist")
 	}
-	if f.guard.hostAllowed("10.0.0.5:3000") {
+	if f.guard.HostAllowed("10.0.0.5:3000") {
 		t.Fatal("arbitrary RFC-1918 IP must not be on the default name allowlist")
 	}
-	if f.guard.hostAllowed("evil-internal") {
+	if f.guard.HostAllowed("evil-internal") {
 		t.Fatal("an unknown internal name must not be on the default allowlist")
 	}
 
@@ -177,17 +189,18 @@ func TestSSRFDefaultStillBlocksArbitraryInternal(t *testing.T) {
 	}
 }
 
-// ipBlocked sanity: the helper itself classifies ranges correctly.
+// TestIPBlockedClassification uses ssrfguard.IPBlocked to confirm the shared
+// function classifies ranges correctly, replacing the local ipBlocked call.
 func TestIPBlockedClassification(t *testing.T) {
 	blocked := []string{"127.0.0.1", "169.254.169.254", "10.1.2.3", "192.168.0.1", "172.16.5.5", "::1", "fc00::1", "0.0.0.0"}
 	for _, s := range blocked {
-		if ip := net.ParseIP(s); !ipBlocked(ip) {
+		if ip := net.ParseIP(s); !ssrfguard.IPBlocked(ip) {
 			t.Fatalf("expected %s to be blocked", s)
 		}
 	}
 	allowed := []string{"8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"}
 	for _, s := range allowed {
-		if ip := net.ParseIP(s); ipBlocked(ip) {
+		if ip := net.ParseIP(s); ssrfguard.IPBlocked(ip) {
 			t.Fatalf("expected %s to be allowed", s)
 		}
 	}
