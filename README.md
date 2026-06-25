@@ -22,3 +22,4 @@ import _ "github.com/BananaLabs-OSS/Pulp-ext-gin"
 - `HTTP_PORT` — listen port (default 8080)
 - `HTTP_CERT` — TLS cert PEM path (optional)
 - `HTTP_KEY` — TLS key PEM path (optional)
+- `HTTP_FETCH_ALLOW` — comma-separated host[:port] or CIDR entries that bypass the SSRF egress guard (optional; default seeds bananagine and minecraft-resolver by name)
