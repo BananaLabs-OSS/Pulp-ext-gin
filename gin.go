@@ -764,7 +764,12 @@ func (f *fetcher) do(ctx context.Context, req abi.HTTPFetchRequest) (abi.HTTPRes
 	if req.Timeout > 0 {
 		timeout = time.Duration(req.Timeout)
 	}
-	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	// Detach from the caller ctx: a cell pulp_step/pulp_on_call runs under a
+	// bounded call_timeout (Pulp/internal/host Cell.callContext), so a fetch
+	// late in a heavy step would otherwise inherit an already-expired compute
+	// budget and fail instantly with "context deadline exceeded" though the
+	// network is fine. Bound it by the request timeout instead.
+	reqCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var body io.Reader
