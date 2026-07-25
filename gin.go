@@ -57,11 +57,48 @@ const (
 // ---------------------------------------------------------------------
 
 var (
+	// The legacy handles preserve the original single-application ABI. In
+	// endpoint-reporting host mode every application instance instead receives
+	// an isolated ginServer (and its WebSocket/SSE state) below.
 	server      *ginServer
 	httpFetcher *fetcher
 	ws          *wsServer
 	sse         *sseServer
+
+	lifecycleMu sync.Mutex
+
+	scopedGinMu      sync.Mutex
+	scopedGinServers = map[applicationInstanceKey]*scopedGinServer{}
+	cellApplications = map[string]applicationInstanceKey{}
+	endpointReporter ext.EndpointReporter
+	endpointLogger   *slog.Logger
+
+	fetchersMu   sync.Mutex
+	cellFetchers = map[string]*fetcher{}
 )
+
+// applicationInstanceKey deliberately excludes cell identity: one app owns
+// one private public listener, while many cells register routes on it.
+type applicationInstanceKey struct {
+	applicationID string
+	instanceID    string
+}
+
+type scopedGinServer struct {
+	server   *ginServer
+	endpoint ext.Endpoint
+	reporter ext.EndpointReporter
+}
+
+func applicationKey(scope ext.Scope) applicationInstanceKey {
+	return applicationInstanceKey{applicationID: scope.ApplicationID(), instanceID: scope.ApplicationInstanceID()}
+}
+
+func scopedEndpointMode() bool {
+	scopedGinMu.Lock()
+	defer scopedGinMu.Unlock()
+	return endpointReporter != nil
+}
 
 // ---------------------------------------------------------------------
 // init — register all four capabilities
@@ -69,14 +106,15 @@ var (
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:           "transport.http.inbound",
-		Register:       httpInboundRegister,
-		Stub:           httpInboundStub,
-		Setup:          httpInboundSetup,
-		Teardown:       httpInboundTeardown,
-		TeardownCell: httpInboundTeardownCell,
-		Poll:           httpInboundPoll,
-		Finalize:       httpInboundFinalize,
+		Name:          "transport.http.inbound",
+		Register:      httpInboundRegister,
+		Stub:          httpInboundStub,
+		Setup:         httpInboundSetup,
+		Teardown:      httpInboundTeardown,
+		TeardownScope: httpInboundTeardownScope,
+		TeardownCell:  httpInboundTeardownCell,
+		Poll:          httpInboundPoll,
+		Finalize:      httpInboundFinalize,
 	})
 
 	ext.Register(ext.Capability{
@@ -86,16 +124,16 @@ func init() {
 	})
 
 	ext.Register(ext.Capability{
-		Name:           "transport.ws.inbound",
-		Register:       wsInboundRegister,
-		Stub:           wsInboundStub,
+		Name:         "transport.ws.inbound",
+		Register:     wsInboundRegister,
+		Stub:         wsInboundStub,
 		TeardownCell: transportTeardownCell,
 	})
 
 	ext.Register(ext.Capability{
-		Name:           "transport.sse",
-		Register:       sseRegister,
-		Stub:           sseStub,
+		Name:         "transport.sse",
+		Register:     sseRegister,
+		Stub:         sseStub,
 		TeardownCell: transportTeardownCell,
 	})
 }
@@ -106,17 +144,11 @@ func init() {
 // check `cellDead` and return 404. Any in-flight requests owned by
 // the cell receive a 503 so finalize doesn't deadlock.
 func httpInboundTeardownCell(_ context.Context, cellID string) error {
-	if server != nil {
-		server.markCellDead(cellID)
-	}
-	return nil
+	return teardownGinCell(context.Background(), cellID)
 }
 
 func transportTeardownCell(_ context.Context, cellID string) error {
-	if server != nil {
-		server.markCellDead(cellID)
-	}
-	return nil
+	return teardownGinCell(context.Background(), cellID)
 }
 
 // =====================================================================
@@ -124,14 +156,17 @@ func transportTeardownCell(_ context.Context, cellID string) error {
 // =====================================================================
 
 type inflightRequest struct {
-	req      abi.HTTPRequest
-	respCh   chan abi.HTTPResponse
+	req    abi.HTTPRequest
+	respCh chan abi.HTTPResponse
 	cellID string // owning cell — set when the matching route was registered
 }
 
 type ginServer struct {
-	addr   string
-	logger *slog.Logger
+	addr string
+	// boundAddr is the actual address after binding. Host-mode applications
+	// always bind 127.0.0.1:0, so advertising addr would be incorrect.
+	boundAddr string
+	logger    *slog.Logger
 
 	engine *gin.Engine
 
@@ -139,10 +174,11 @@ type ginServer struct {
 	pending map[uint64]*inflightRequest
 	nextID  atomic.Uint64
 
-	queue chan *inflightRequest
-	srv   *http.Server
-	ws    *wsServer
-	sse   *sseServer
+	queue    chan *inflightRequest
+	srv      *http.Server
+	listener net.Listener
+	ws       *wsServer
+	sse      *sseServer
 
 	certPath string
 	keyPath  string
@@ -182,14 +218,110 @@ func newGinServer(addr string, logger *slog.Logger) *ginServer {
 	})
 
 	return &ginServer{
-		addr:        addr,
-		logger:      logger,
-		engine:      engine,
-		pending:     map[uint64]*inflightRequest{},
-		queue:       make(chan *inflightRequest, 64),
-		altServers:  map[string]*http.Server{},
-		deadCells: map[string]struct{}{},
+		addr:       addr,
+		logger:     logger,
+		engine:     engine,
+		pending:    map[uint64]*inflightRequest{},
+		queue:      make(chan *inflightRequest, 64),
+		altServers: map[string]*http.Server{},
+		deadCells:  map[string]struct{}{},
 	}
+}
+
+// resolveGinServerForCell selects the isolated application listener in host
+// endpoint mode. Legacy callers keep the process-wide server and HTTP_PORT
+// behavior exactly as before.
+func resolveGinServerForCell(cellID string, scope ext.Scope, requestedAddr string) *ginServer {
+	if scope.IsLegacy() || !scopedEndpointMode() {
+		return server
+	}
+	key := applicationKey(scope)
+	scopedGinMu.Lock()
+	defer scopedGinMu.Unlock()
+	if existing := scopedGinServers[key]; existing != nil {
+		// A hosted application has one public endpoint. A guest may call
+		// http_listen, but cannot silently split its routes onto another host.
+		if requestedAddr != "" && requestedAddr != existing.server.addr && requestedAddr != existing.server.boundAddr {
+			return nil
+		}
+		cellApplications[cellID] = key
+		return existing.server
+	}
+	if requestedAddr == "" {
+		requestedAddr = "127.0.0.1:0"
+	}
+	logger := endpointLogger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	created := newGinServer(requestedAddr, logger)
+	created.attachWebSocket(newWSServer(logger))
+	created.attachSSE(newSSEServer(logger))
+	if err := created.start(context.Background()); err != nil {
+		logger.Error("scoped gin listener failed", "cell", cellID, "addr", requestedAddr, "err", err)
+		return nil
+	}
+	endpoint := ext.Endpoint{Scope: scope, Capability: "transport.http.inbound", Name: "public", Address: created.boundAddr}
+	if err := endpointReporter.Ready(endpoint); err != nil {
+		_ = created.stop(context.Background())
+		logger.Error("publish scoped gin endpoint", "cell", cellID, "addr", created.boundAddr, "err", err)
+		return nil
+	}
+	scopedGinServers[key] = &scopedGinServer{server: created, endpoint: endpoint, reporter: endpointReporter}
+	cellApplications[cellID] = key
+	return created
+}
+
+func allGinServers() []*ginServer {
+	scopedGinMu.Lock()
+	defer scopedGinMu.Unlock()
+	out := make([]*ginServer, 0, len(scopedGinServers)+1)
+	if server != nil {
+		out = append(out, server)
+	}
+	for _, owned := range scopedGinServers {
+		out = append(out, owned.server)
+	}
+	return out
+}
+
+// existingGinServerForCell is intentionally non-creating. Outbound fetch is
+// useful without an inbound listener, so binding transport.http.outbound must
+// never allocate a public endpoint as a side effect.
+func existingGinServerForCell(cellID string, scope ext.Scope) *ginServer {
+	if scope.IsLegacy() || !scopedEndpointMode() {
+		return server
+	}
+	scopedGinMu.Lock()
+	defer scopedGinMu.Unlock()
+	key, ok := cellApplications[cellID]
+	if !ok {
+		key = applicationKey(scope)
+	}
+	if owned := scopedGinServers[key]; owned != nil {
+		return owned.server
+	}
+	return nil
+}
+
+func fetcherForCell(cellID string, logger *slog.Logger) *fetcher {
+	if cellID == "" {
+		return httpFetcher
+	}
+	fetchersMu.Lock()
+	defer fetchersMu.Unlock()
+	if f := cellFetchers[cellID]; f != nil {
+		return f
+	}
+	f := newFetcher(logger)
+	cellFetchers[cellID] = f
+	return f
+}
+
+func dropFetcherForCell(cellID string) {
+	fetchersMu.Lock()
+	delete(cellFetchers, cellID)
+	fetchersMu.Unlock()
 }
 
 func (s *ginServer) attachWebSocket(w *wsServer) { s.ws = w }
@@ -444,7 +576,7 @@ func (s *ginServer) handleHTTPRequestFor(c *gin.Context, cellID string) {
 			Body:       body,
 			RemoteAddr: c.Request.RemoteAddr,
 		},
-		respCh:   make(chan abi.HTTPResponse, 1),
+		respCh: make(chan abi.HTTPResponse, 1),
 		cellID: cellID,
 	}
 
@@ -493,23 +625,29 @@ func (s *ginServer) handleHTTPRequestFor(c *gin.Context, cellID string) {
 }
 
 func (s *ginServer) start(_ context.Context) error {
+	listener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", s.addr, err)
+	}
+	s.listener = listener
+	s.boundAddr = listener.Addr().String()
 	s.srv = &http.Server{
-		Addr:    s.addr,
+		Addr:    s.boundAddr,
 		Handler: s.engine,
 	}
 	useTLS := s.certPath != "" && s.keyPath != ""
 	go func() {
-		var err error
+		var serveErr error
 		if useTLS {
-			err = s.srv.ListenAndServeTLS(s.certPath, s.keyPath)
+			serveErr = s.srv.ServeTLS(listener, s.certPath, s.keyPath)
 		} else {
-			err = s.srv.ListenAndServe()
+			serveErr = s.srv.Serve(listener)
 		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("http listen failed", "err", err)
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			s.logger.Error("http listen failed", "err", serveErr)
 		}
 	}()
-	s.logger.Info("gin server started", "addr", s.addr, "tls", useTLS)
+	s.logger.Info("gin server started", "addr", s.boundAddr, "tls", useTLS)
 	return nil
 }
 
@@ -1252,20 +1390,39 @@ func formatSSEFrame(req abi.SSEEmitRequest) []byte {
 // =====================================================================
 
 func httpInboundSetup(env ext.SetupEnv) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	logger := env.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if httpFetcher == nil {
+		httpFetcher = newFetcher(logger)
+	}
+	if ws == nil {
+		ws = newWSServer(logger)
+	}
+	if sse == nil {
+		sse = newSSEServer(logger)
+	}
+
+	// An endpoint reporter means a Pulp multi-application host owns external
+	// routing. Allocate private listeners lazily per application when its first
+	// route registers; do not read HTTP_PORT or create a process-global server.
+	if env.Endpoints != nil {
+		scopedGinMu.Lock()
+		endpointReporter = env.Endpoints
+		endpointLogger = logger
+		scopedGinMu.Unlock()
+		return nil
+	}
+
 	port := os.Getenv("HTTP_PORT")
 	if port == "" {
 		port = "8080"
 	}
 	addr := ":" + port
-	logger := env.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-
 	server = newGinServer(addr, logger)
-	httpFetcher = newFetcher(logger)
-	ws = newWSServer(logger)
-	sse = newSSEServer(logger)
 
 	server.attachWebSocket(ws)
 	server.attachSSE(sse)
@@ -1282,49 +1439,142 @@ func httpInboundSetup(env ext.SetupEnv) error {
 }
 
 func httpInboundTeardown(ctx context.Context) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	scopedGinMu.Lock()
+	scoped := scopedGinServers
+	scopedGinServers = map[applicationInstanceKey]*scopedGinServer{}
+	cellApplications = map[string]applicationInstanceKey{}
+	endpointReporter = nil
+	endpointLogger = nil
+	scopedGinMu.Unlock()
+	for _, owned := range scoped {
+		owned.reporter.Gone(owned.endpoint)
+	}
 	if ws != nil {
 		ws.stop()
 	}
 	if sse != nil {
 		sse.stop()
 	}
+	var firstErr error
 	if server != nil {
-		return server.stop(ctx)
+		if err := server.stop(ctx); err != nil {
+			firstErr = err
+		}
 	}
-	return nil
+	for _, owned := range scoped {
+		if err := owned.server.stop(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	server, httpFetcher, ws, sse = nil, nil, nil, nil
+	fetchersMu.Lock()
+	cellFetchers = map[string]*fetcher{}
+	fetchersMu.Unlock()
+	return firstErr
+}
+
+// httpInboundTeardownScope stops exactly one hosted application listener.
+// Sibling applications retain their Gin engine, WebSocket/SSE state, outbound
+// clients, and endpoint registrations.
+func httpInboundTeardownScope(ctx context.Context, scope ext.Scope) error {
+	key := applicationKey(scope)
+	scopedGinMu.Lock()
+	owned := scopedGinServers[key]
+	delete(scopedGinServers, key)
+	cellIDs := make([]string, 0)
+	for cellID, cellKey := range cellApplications {
+		if cellKey == key {
+			cellIDs = append(cellIDs, cellID)
+			delete(cellApplications, cellID)
+		}
+	}
+	scopedGinMu.Unlock()
+	for _, cellID := range cellIDs {
+		dropFetcherForCell(cellID)
+	}
+	if owned == nil {
+		return nil
+	}
+	owned.reporter.Gone(owned.endpoint)
+	if owned.server.ws != nil {
+		owned.server.ws.stop()
+	}
+	if owned.server.sse != nil {
+		owned.server.sse.stop()
+	}
+	return owned.server.stop(ctx)
+}
+
+func teardownGinCell(ctx context.Context, cellID string) error {
+	for _, current := range allGinServers() {
+		current.markCellDead(cellID)
+	}
+	dropFetcherForCell(cellID)
+	var retired *scopedGinServer
+	scopedGinMu.Lock()
+	if key, ok := cellApplications[cellID]; ok {
+		delete(cellApplications, cellID)
+		stillOwned := false
+		for _, other := range cellApplications {
+			if other == key {
+				stillOwned = true
+				break
+			}
+		}
+		if !stillOwned {
+			retired = scopedGinServers[key]
+			delete(scopedGinServers, key)
+		}
+	}
+	scopedGinMu.Unlock()
+	if retired == nil {
+		return nil
+	}
+	retired.reporter.Gone(retired.endpoint)
+	if retired.server.ws != nil {
+		retired.server.ws.stop()
+	}
+	if retired.server.sse != nil {
+		retired.server.sse.stop()
+	}
+	return retired.server.stop(ctx)
 }
 
 func httpInboundPoll() (ext.StepEvent, bool) {
 	// Check HTTP queue first.
-	if server != nil {
-		if req, cellID, ok := server.popRequest(); ok {
+	for _, current := range allGinServers() {
+		if req, cellID, ok := current.popRequest(); ok {
 			payload, err := abi.EncodeHTTPRequest(req)
 			if err != nil {
-				server.logger.Error("encode http request", "err", err)
+				current.logger.Error("encode http request", "err", err)
 				return ext.StepEvent{}, false
 			}
 			return ext.StepEvent{
-				Kind:     "http.request",
-				Payload:  payload,
-				ID:       req.ID,
-				CellID: cellID,
+				Kind:    "http.request",
+				Payload: payload,
+				ID:      req.ID,
+				CellID:  cellID,
 			}, true
 		}
 	}
 
 	// Then check WebSocket events.
-	if ws != nil {
-		if wev, ok := ws.popEvent(); ok {
-			ev, err := abi.DecodeStepEvent(wev.data)
-			if err != nil {
-				ws.logger.Error("decode ws step event", "err", err)
-				return ext.StepEvent{}, false
+	for _, current := range allGinServers() {
+		if current.ws != nil {
+			if wev, ok := current.ws.popEvent(); ok {
+				ev, err := abi.DecodeStepEvent(wev.data)
+				if err != nil {
+					current.ws.logger.Error("decode ws step event", "err", err)
+					return ext.StepEvent{}, false
+				}
+				return ext.StepEvent{
+					Kind:    ev.Kind,
+					Payload: ev.Payload,
+					CellID:  wev.cellID,
+				}, true
 			}
-			return ext.StepEvent{
-				Kind:    ev.Kind,
-				Payload: ev.Payload,
-				CellID:  wev.cellID,
-			}, true
 		}
 	}
 
@@ -1332,8 +1582,8 @@ func httpInboundPoll() (ext.StepEvent, bool) {
 }
 
 func httpInboundFinalize(id uint64) {
-	if server != nil {
-		server.finalize(id)
+	for _, current := range allGinServers() {
+		current.finalize(id)
 	}
 }
 
@@ -1342,7 +1592,12 @@ func httpInboundFinalize(id uint64) {
 // =====================================================================
 
 func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	cellID := ext.CellIDOf(cell)
+	scope := ext.ScopeOf(cell)
+	cellServer := resolveGinServerForCell(cellID, scope, "")
+	if cellServer == nil {
+		return errors.New("transport.http.inbound is not initialized for application scope")
+	}
 	// http_listen(addr) — cell declares an additional listen address.
 	// If it matches the default HTTP_PORT-derived addr, it's a no-op.
 	// Otherwise an additional http.Server is started sharing the same
@@ -1366,8 +1621,14 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if reg.Addr == "" {
 				return 4
 			}
-			if err := server.ensureAltListener(reg.Addr); err != nil {
-				server.logger.Error("http_listen bind failed", "addr", reg.Addr, "err", err)
+			if !scope.IsLegacy() && scopedEndpointMode() {
+				if resolveGinServerForCell(cellID, scope, reg.Addr) == nil {
+					return 5
+				}
+				return 0
+			}
+			if err := cellServer.ensureAltListener(reg.Addr); err != nil {
+				cellServer.logger.Error("http_listen bind failed", "addr", reg.Addr, "err", err)
 				return 5
 			}
 			return 0
@@ -1390,7 +1651,7 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err := msgpack.Unmarshal(data, &reg); err != nil {
 				return 3
 			}
-			if err := server.registerRoute(cellID, reg.Method, reg.Path); err != nil {
+			if err := cellServer.registerRoute(cellID, reg.Method, reg.Path); err != nil {
 				return 4
 			}
 			return 0
@@ -1410,7 +1671,7 @@ func httpInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
-			if err := server.respond(resp); err != nil {
+			if err := cellServer.respond(resp); err != nil {
 				return 4
 			}
 			return 0
@@ -1437,7 +1698,13 @@ func httpInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // Capability bindings: transport.http.outbound
 // =====================================================================
 
-func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
+func httpOutboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	cellID := ext.CellIDOf(cell)
+	logger := slog.Default()
+	if cellServer := existingGinServerForCell(cellID, ext.ScopeOf(cell)); cellServer != nil {
+		logger = cellServer.logger
+	}
+	cellFetcher := fetcherForCell(cellID, logger)
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 			if reqLen == 0 {
@@ -1452,7 +1719,7 @@ func httpOutboundRegister(b wazero.HostModuleBuilder, _ ext.Cell) error {
 				return 3
 			}
 
-			resp, err := httpFetcher.do(ctx, req)
+			resp, err := cellFetcher.do(ctx, req)
 			if err != nil {
 				return 4
 			}
@@ -1502,7 +1769,11 @@ func httpOutboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // =====================================================================
 
 func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	cellID := ext.CellIDOf(cell)
+	cellServer := resolveGinServerForCell(cellID, ext.ScopeOf(cell), "")
+	if cellServer == nil || cellServer.ws == nil {
+		return errors.New("transport.ws.inbound is not initialized for application scope")
+	}
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 			if pathLen == 0 {
@@ -1512,7 +1783,7 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !ok {
 				return 2
 			}
-			if err := server.registerWSRoute(cellID, string(data)); err != nil {
+			if err := cellServer.registerWSRoute(cellID, string(data)); err != nil {
 				return 4
 			}
 			return 0
@@ -1532,7 +1803,7 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
-			if err := ws.send(ctx, req); err != nil {
+			if err := cellServer.ws.send(ctx, req); err != nil {
 				return 4
 			}
 			return 0
@@ -1552,7 +1823,7 @@ func wsInboundRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
-			if err := ws.close(req); err != nil {
+			if err := cellServer.ws.close(req); err != nil {
 				return 4
 			}
 			return 0
@@ -1580,7 +1851,11 @@ func wsInboundStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 // =====================================================================
 
 func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	cellID := ext.CellIDOf(cell)
+	cellServer := resolveGinServerForCell(cellID, ext.ScopeOf(cell), "")
+	if cellServer == nil || cellServer.sse == nil {
+		return errors.New("transport.sse is not initialized for application scope")
+	}
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, pathPtr, pathLen uint32) uint32 {
 			if pathLen == 0 {
@@ -1590,7 +1865,7 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !ok {
 				return 2
 			}
-			if err := server.registerSSERoute(cellID, string(data)); err != nil {
+			if err := cellServer.registerSSERoute(cellID, string(data)); err != nil {
 				return 4
 			}
 			return 0
@@ -1610,7 +1885,7 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err != nil {
 				return 3
 			}
-			if err := sse.emit(req); err != nil {
+			if err := cellServer.sse.emit(req); err != nil {
 				return 4
 			}
 			return 0
@@ -1629,7 +1904,7 @@ func sseRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !ok {
 				return 2
 			}
-			count := sse.hasSubscribers(string(data))
+			count := cellServer.sse.hasSubscribers(string(data))
 			if !m.Memory().WriteUint32Le(outCountPtr, count) {
 				return 8
 			}
