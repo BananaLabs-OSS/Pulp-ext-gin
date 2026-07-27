@@ -252,16 +252,9 @@ func resolveGinServerForCell(cellID string, scope ext.Scope, requestedAddr strin
 		return existing.server
 	}
 	if requestedAddr == "" {
-		// The host endpoint reporter still needs a reachable listener in a
-		// containerized deployment. Honor the established HTTP_PORT contract
-		// for the first/public application; callers that explicitly request an
-		// address retain isolated listener behavior.
-		port := os.Getenv("HTTP_PORT")
-		if port != "" && scope.ApplicationID() == "evolution" {
-			requestedAddr = ":" + port
-		} else {
-			requestedAddr = "127.0.0.1:0"
-		}
+		// The Pulp host gateway owns the external HTTP_PORT. Application Gin
+		// listeners stay private and are published through the endpoint reporter.
+		requestedAddr = "127.0.0.1:0"
 	}
 	logger := endpointLogger
 	if logger == nil {
