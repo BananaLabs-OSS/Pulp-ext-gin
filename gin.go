@@ -252,7 +252,15 @@ func resolveGinServerForCell(cellID string, scope ext.Scope, requestedAddr strin
 		return existing.server
 	}
 	if requestedAddr == "" {
-		requestedAddr = "127.0.0.1:0"
+		// The host endpoint reporter still needs a reachable listener in a
+		// containerized deployment. Honor the established HTTP_PORT contract
+		// for the first/public application; callers that explicitly request an
+		// address retain isolated listener behavior.
+		port := os.Getenv("HTTP_PORT")
+		if port == "" {
+			port = "8080"
+		}
+		requestedAddr = ":" + port
 	}
 	logger := endpointLogger
 	if logger == nil {
