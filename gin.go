@@ -257,10 +257,11 @@ func resolveGinServerForCell(cellID string, scope ext.Scope, requestedAddr strin
 		// for the first/public application; callers that explicitly request an
 		// address retain isolated listener behavior.
 		port := os.Getenv("HTTP_PORT")
-		if port == "" {
-			port = "8080"
+		if port != "" && scope.ApplicationID() == "evolution" {
+			requestedAddr = ":" + port
+		} else {
+			requestedAddr = "127.0.0.1:0"
 		}
-		requestedAddr = ":" + port
 	}
 	logger := endpointLogger
 	if logger == nil {
