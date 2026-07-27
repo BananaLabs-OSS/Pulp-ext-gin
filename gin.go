@@ -107,6 +107,7 @@ func scopedEndpointMode() bool {
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "transport.http.inbound",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-gin",
 		Register:      httpInboundRegister,
 		Stub:          httpInboundStub,
 		Setup:         httpInboundSetup,
@@ -119,12 +120,14 @@ func init() {
 
 	ext.Register(ext.Capability{
 		Name:     "transport.http.outbound",
+		Provider: "github.com/BananaLabs-OSS/Pulp-ext-gin",
 		Register: httpOutboundRegister,
 		Stub:     httpOutboundStub,
 	})
 
 	ext.Register(ext.Capability{
 		Name:         "transport.ws.inbound",
+		Provider:     "github.com/BananaLabs-OSS/Pulp-ext-gin",
 		Register:     wsInboundRegister,
 		Stub:         wsInboundStub,
 		TeardownCell: transportTeardownCell,
@@ -132,6 +135,7 @@ func init() {
 
 	ext.Register(ext.Capability{
 		Name:         "transport.sse",
+		Provider:     "github.com/BananaLabs-OSS/Pulp-ext-gin",
 		Register:     sseRegister,
 		Stub:         sseStub,
 		TeardownCell: transportTeardownCell,
