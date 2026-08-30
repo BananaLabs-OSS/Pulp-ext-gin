@@ -465,7 +465,14 @@ func (s *ginServer) registerSSERoute(cellID, path string) error {
 				c.Data(http.StatusNotFound, "text/plain", []byte("404 page not found"))
 				return
 			}
-			s.sse.handle(c.Writer, c.Request)
+			if requestAcceptsEventStream(c.Request) {
+				s.sse.handle(c.Writer, c.Request)
+				return
+			}
+			// One path may deliberately provide both SSE and a bounded HTTP
+			// polling fallback. SSE can win Gin's first-registration race
+			// without hijacking ordinary JSON GETs on that path.
+			s.handleHTTPRequestFor(c, cellID)
 		})
 	}); err != nil {
 		s.logger.Info("sse route deferred (http route already present)", "cell", cellID, "path", path)
@@ -473,6 +480,21 @@ func (s *ginServer) registerSSERoute(cellID, path string) error {
 	}
 	s.logger.Info("sse route registered", "cell", cellID, "path", path)
 	return nil
+}
+
+func requestAcceptsEventStream(request *http.Request) bool {
+	if request == nil {
+		return false
+	}
+	for _, value := range request.Header.Values("Accept") {
+		for _, item := range strings.Split(value, ",") {
+			mediaType := strings.TrimSpace(strings.SplitN(item, ";", 2)[0])
+			if strings.EqualFold(mediaType, "text/event-stream") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // engineHandleSafe runs a route registration with a recover. Gin's
