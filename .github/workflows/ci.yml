@@ -8,7 +8,7 @@ permissions:
   contents: read
 jobs:
   test:
-    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@179b5308861a441aa5f8c81c1f1a41c39732c385
+    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@bdc81a8a0f751c60140d9d1505c56853475cc85f
     with:
       sibling-repositories: BananaLabs-OSS/Pulp
 
